@@ -26,3 +26,5 @@ worker = { workspace = true }
 itertools = "0.14.0"
 gpu_prover = { workspace = true }
 rayon = "1.10.0"
+risc_v_simulator = { workspace = true, features = ["delegation"] }
+bitvec = "1.0.1"
