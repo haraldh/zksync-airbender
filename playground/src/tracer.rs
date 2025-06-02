@@ -2,14 +2,15 @@
 // - rs2 is register or RAM read
 // - rd is register or RAM write
 
-use bitvec::bitvec;
-use bitvec::vec::BitVec;
 use cs::definitions::{TimestampData, TimestampScalar, TIMESTAMP_STEP};
 use fft::GoodAllocator;
+use itertools::{enumerate, Itertools};
+use prover::definitions::LazyInitAndTeardown;
 use prover::tracers::delegation::DelegationWitness;
 use prover::tracers::main_cycle_optimized::{
     CycleData, RegIndexOrMemWordIndex, SingleCycleTracingData, EMPTY_SINGLE_CYCLE_TRACING_DATA,
 };
+use prover::ShuffleRamSetupAndTeardown;
 use risc_v_simulator::abstractions::tracer::{
     RegisterOrIndirectReadData, RegisterOrIndirectReadWriteData, Tracer,
 };
@@ -18,11 +19,13 @@ use risc_v_simulator::cycle::state_new::RiscV32StateForUnrolledProver;
 use risc_v_simulator::cycle::{IMStandardIsaConfig, MachineConfig};
 use std::alloc::Global;
 use std::collections::HashMap;
-
+use std::time::Instant;
+use worker::Worker;
 // NOTE: this tracer ALLOWS for delegations to initialize memory, so we should use enough cycles
 // to eventually perform all the inits
 
 const PAGE_WORDS_LOG_SIZE: usize = 10; // 4 KiB page size, 4 bytes per word
+// const PAGE_WORDS_SIZE: usize = 1 << PAGE_WORDS_LOG_SIZE;
 
 #[derive(Clone, Debug)]
 pub struct RamTracingData<const TRACE_TOUCHED_RAM: bool, const TRACE_TIMESTAMPS: bool> {
@@ -30,7 +33,8 @@ pub struct RamTracingData<const TRACE_TOUCHED_RAM: bool, const TRACE_TIMESTAMPS:
     pub ram_words_last_live_timestamps: Vec<TimestampScalar>,
     // pub access_bitmask: BitVec,
     // pub num_touched_ram_cells: usize,
-    pub num_touched_ram_cells: Vec<u32>,
+    pub num_touched_ram_cells_in_page: Vec<u32>,
+    pub num_touched_ram_cells_total: u32,
     pub rom_bound: usize,
 }
 
@@ -60,7 +64,7 @@ impl<const TRACE_TOUCHED_RAM: bool, const TRACE_TIMESTAMPS: bool>
         //     BitVec::new()
         // };
 
-        let num_touched_ram_cells = if TRACE_TOUCHED_RAM {
+        let num_touched_ram_cells_in_page = if TRACE_TOUCHED_RAM {
             let num_pages = num_words.div_ceil(1 << PAGE_WORDS_LOG_SIZE);
             vec![0; num_pages]
         } else {
@@ -78,7 +82,8 @@ impl<const TRACE_TOUCHED_RAM: bool, const TRACE_TIMESTAMPS: bool>
             ram_words_last_live_timestamps,
             // access_bitmask,
             // num_touched_ram_cells: 0,
-            num_touched_ram_cells,
+            num_touched_ram_cells_in_page,
+            num_touched_ram_cells_total: 0,
             rom_bound,
         }
     }
@@ -141,12 +146,76 @@ impl<const TRACE_TOUCHED_RAM: bool, const TRACE_TIMESTAMPS: bool>
             if read_timestamp == 0 {
                 // this is a new cell
                 let page_idx = (phys_word_idx >> PAGE_WORDS_LOG_SIZE) as usize;
-                unsafe { *self.num_touched_ram_cells.get_unchecked_mut(page_idx) += 1 };
+                unsafe { *self.num_touched_ram_cells_in_page.get_unchecked_mut(page_idx) += 1 };
+                self.num_touched_ram_cells_total += 1;
             }
         }
 
         debug_assert!(read_timestamp < write_timestamp);
         read_timestamp
+    }
+
+    pub fn get_touched_ram_cells_count(&self) -> u32 {
+        assert!(TRACE_TOUCHED_RAM);
+        self.num_touched_ram_cells_in_page.iter().copied().sum::<u32>()
+    }
+
+    pub fn get_setup_and_teardown_chunks<'a, A: GoodAllocator + 'a>(
+        &'a self,
+        memory: &'a [u32],
+        chunk_size: usize,
+        available_chunks: impl IntoIterator<Item = ShuffleRamSetupAndTeardown<A>> + 'a,
+    ) -> (
+        usize,
+        impl Iterator<Item = ShuffleRamSetupAndTeardown<A>> + 'a,
+    ) {
+        assert!(TRACE_TOUCHED_RAM);
+        let page_indexes = self
+            .num_touched_ram_cells_in_page
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(move |(index, count)| if count == 0 { None } else { Some(index) })
+            .collect_vec();
+        let mut src = page_indexes.into_iter()
+            .flat_map(move |index| {
+                let range_start = index << PAGE_WORDS_LOG_SIZE;
+                let range_end = index + 1 << PAGE_WORDS_LOG_SIZE;
+                let values = &memory[range_start..range_end];
+                let timestamps = &self.ram_words_last_live_timestamps[range_start..range_end];
+                timestamps
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(move |(index, timestamp)| {
+                        if timestamp != 0 {
+                            let result = LazyInitAndTeardown {
+                                address: (range_start as u32 + index as u32) << 2,
+                                teardown_value: unsafe { *values.get_unchecked(index) },
+                                teardown_timestamp: TimestampData::from_scalar(timestamp),
+                            };
+                            Some(result)
+                        } else {
+                            None
+                        }
+                    })
+            });
+        let touched_ram_cells_count = self.get_touched_ram_cells_count() as usize;
+        let chunks_needed = touched_ram_cells_count.div_ceil(chunk_size);
+        let padding_size = chunks_needed * chunk_size - touched_ram_cells_count;
+        let chunks = available_chunks
+            .into_iter()
+            .take(chunks_needed)
+            .enumerate()
+            .map(move |(index, mut chunk)| {
+                let data = &mut chunk.lazy_init_data;
+                assert_eq!(data.len(), chunk_size);
+                let (padding, dst) = data.split_at_mut(if index == 0 { padding_size } else { 0 });
+                padding.fill(LazyInitAndTeardown::default());
+                dst.fill_with(|| unsafe { src.next().unwrap_unchecked() });
+                chunk
+            });
+        (chunks_needed, chunks)
     }
 }
 
