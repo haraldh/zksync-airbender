@@ -1948,6 +1948,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "machine_without_signed_mul_div_verifier"
+version = "0.1.0"
+dependencies = [
+ "field",
+ "proc-macro2",
+ "prover",
+ "quote",
+ "risc_v_simulator",
+ "serde",
+ "serde_json",
+ "syn 2.0.101",
+ "unroll",
+ "verifier_common",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2158,6 +2174,19 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "opcode_tests"
+version = "0.1.0"
+dependencies = [
+ "cs",
+ "field",
+ "lib-rv32-asm",
+ "prover",
+ "regex",
+ "risc_v_simulator",
+ "setups",
+]
 
 [[package]]
 name = "openssl"
