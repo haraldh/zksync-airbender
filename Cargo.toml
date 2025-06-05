@@ -34,6 +34,7 @@ members = [
     "poseidon2",
     "prover",
     "risc_v_simulator",
+    "riscv_common",
     "tools/cli",
     "tools/generator",
     "tools/zksmith",
